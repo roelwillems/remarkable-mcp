@@ -18,7 +18,7 @@ from PIL import Image
 from remarkable_mcp.extract import (
     _resolve_pdf_page_index,
     render_merged_page_from_extracted_document,
-    render_page_full_page_from_extracted_document,
+    render_page_annotation_layer_from_extracted_document,
 )
 
 PdfMode = Literal["merged", "annotations"]
@@ -264,7 +264,9 @@ def render_archive_pages(
                     )
                     continue
 
-                full_page = render_page_full_page_from_extracted_document(
+                # PDF-backed pages render on their PDF page geometry (keeps the
+                # page size and ink colours); other pages on the paper grid.
+                full_page = render_page_annotation_layer_from_extracted_document(
                     extracted,
                     page=page_number,
                     background_color=background_color,

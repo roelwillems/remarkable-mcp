@@ -141,7 +141,7 @@ class TestPdfExporters:
             return _png(("red", "green", "blue")[page - 1]), (1404.0, 1872.0)
 
         with patch(
-            "remarkable_mcp.exporters.render_page_full_page_from_extracted_document",
+            "remarkable_mcp.exporters.render_page_annotation_layer_from_extracted_document",
             side_effect=render,
         ):
             pages = list(render_archive_pages(archive_path, _metadata(), pdf_mode="merged"))

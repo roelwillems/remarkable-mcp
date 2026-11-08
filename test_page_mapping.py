@@ -217,9 +217,13 @@ def test_glyph_range_rectangles_render_as_translucent_highlights():
 
     paths, coords = _v6_paths_from_blocks([block])
 
+    # PenColor.YELLOW (3) comes from the shared palette (rmc's #FBF719, kept in
+    # data-color-hex). The paint is the translucent equivalent of multiplying it
+    # onto paper at 0.35, so the highlight never covers what is underneath.
     assert paths == [
         '<rect x="10.0" y="20.0" width="30.0" height="8.0" '
-        'fill="#FFD700" opacity="0.35" stroke="none"/>'
+        'fill="#FBF600" opacity="0.316" stroke="none" style="mix-blend-mode:multiply" '
+        'data-tool="text_highlight" data-color="yellow" data-color-hex="#FBF719"/>'
     ]
     assert coords == [(10.0, 20.0), (40.0, 28.0)]
 

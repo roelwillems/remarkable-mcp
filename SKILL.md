@@ -86,7 +86,8 @@ For handwriting OCR, add a Google Vision API key:
 | `remarkable_browse` | Browse folders, search by name, filter by tags |
 | `remarkable_search` | Multi-document content search with OCR |
 | `remarkable_recent` | List recently modified documents |
-| `remarkable_image` | Render pages as PNG or SVG |
+| `remarkable_image` | Render pages as PNG or SVG, in the ink's own colours |
+| `remarkable_strokes` | Stroke tool, colour and position (PDF points) as JSON |
 | `remarkable_status` | Check connection and device info |
 
 ## Workflow
@@ -94,4 +95,5 @@ For handwriting OCR, add a Google Vision API key:
 1. Use `remarkable_browse` or `remarkable_search` to find documents
 2. Use `remarkable_read` to extract text content
 3. Use `remarkable_image` to render visual pages
-4. Use `page` parameter to paginate through multi-page documents
+4. Use `remarkable_strokes` when the pen, colour or position of ink matters
+5. Use `page` parameter to paginate through multi-page documents

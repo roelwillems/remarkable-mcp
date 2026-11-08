@@ -186,9 +186,11 @@ def _make_image_resource(client, document):
             tmp_path = Path(tmp.name)
 
         try:
-            # Use reMarkable standard background color for resources
+            # Use reMarkable standard background color for resources, and the
+            # same default extent as remarkable_image (whole PDF page for
+            # PDF-backed pages, ink crop for notebooks).
             png_data = render_page_from_document_zip(
-                tmp_path, page_num, background_color=get_background_color()
+                tmp_path, page_num, background_color=get_background_color(), full_page=None
             )
             if png_data is None:
                 raise RuntimeError(
@@ -227,9 +229,10 @@ def _make_svg_resource(client, document):
             tmp_path = Path(tmp.name)
 
         try:
-            # Use reMarkable standard background color for resources
+            # Use reMarkable standard background color for resources, and the
+            # same default extent as remarkable_image.
             svg_content = render_page_from_document_zip_svg(
-                tmp_path, page_num, background_color=get_background_color()
+                tmp_path, page_num, background_color=get_background_color(), full_page=None
             )
             if svg_content is None:
                 raise RuntimeError(f"Failed to render page {page_num} to SVG.")

@@ -426,9 +426,10 @@ Or copy the `SKILL.md` from this repository into your `~/.openclaw/skills/remark
 | `remarkable_recent` | Get recently modified documents |
 | `remarkable_status` | Check connection status and the per-transport capability matrix |
 | `remarkable_image` | Get PNG/SVG images of pages with optional OCR |
+| `remarkable_strokes` | Get every stroke's tool, colour and page position (PDF points) as JSON |
 | `remarkable_export` | Export one document as a temporary PDF or Markdown resource |
 
-The read/search/render tools are read-only. `remarkable_export` never changes the
+The read/search/render/stroke tools are read-only. `remarkable_export` never changes the
 tablet, but it writes a bounded temporary file on the MCP server host and therefore
 declares `readOnlyHint=false`. Export links expire after 15 minutes and the server
 retains at most eight at a time.
@@ -443,7 +444,13 @@ disable them. See [Write Tools](#write-tools-by-transport). Clients that support
 - Browsing a document path returns its content.
 - Empty notebook text can trigger OCR automatically.
 - Search can scan several matching documents.
-- Image tools return visual content that text extraction misses.
+- Image tools return visual content that text extraction misses. Every render
+  keeps each stroke's colour and tool; highlights blend with multiply.
+- Annotation-only images of PDF-backed pages cover the whole PDF page by default
+  (`full_page`); notebook pages are cropped to the ink.
+- `remarkable_strokes` reports each stroke's tool and colour with its position in
+  PDF points, text highlights with their colour, and nearby strokes grouped into
+  clusters (optionally with OCR).
 - `remarkable_read.total_pages` is the physical document count; `content_pages`
   counts extracted-text chunks, and `more` / `next_page` continue those chunks.
   Raw PDF reads count pages from the already-downloaded PDF. If a raw EPUB's

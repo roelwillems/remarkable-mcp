@@ -11,8 +11,10 @@ import time
 import zipfile
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 from xml.sax.saxutils import escape as _xml_escape
+
+from remarkable_mcp import ink as _ink
 
 logger = logging.getLogger(__name__)
 
@@ -443,25 +445,45 @@ def _get_svg_content_bounds(svg_path: Path) -> Optional[tuple]:
 CONTENT_PADDING = 20  # Padding around content bounds for SVG viewBox
 
 
-def _svg_from_paths(paths: list, all_coords: list) -> Optional[str]:
+def _crop_box(all_coords: list, pad: float = CONTENT_PADDING) -> Tuple[int, int, int, int]:
+    """Content crop ``(min_x, min_y, w, h)`` in whole stroke units.
+
+    ``pad`` should include half the widest stroke so wide strokes (highlighters
+    reach ~110 units) are not clipped at the crop edge.
+    """
+    xs = [c[0] for c in all_coords]
+    ys = [c[1] for c in all_coords]
+    min_x = min(xs) - pad
+    min_y = min(ys) - pad
+    w = max(xs) - min_x + pad
+    h = max(ys) - min_y + pad
+    return round(min_x), round(min_y), max(1, round(w)), max(1, round(h))
+
+
+def _svg_document(
+    elements: list,
+    viewbox: Tuple[float, float, float, float],
+    width: float,
+    height: float,
+    root_attrs: str = "",
+) -> str:
+    """Wrap SVG elements in a root with the given viewBox and size."""
+    vb = " ".join(_ink._fmt(v) for v in viewbox)
+    return (
+        f'<?xml version="1.0" encoding="UTF-8"?>'
+        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'viewBox="{vb}" width="{_ink._fmt(width)}" height="{_ink._fmt(height)}"{root_attrs}>'
+        f"{''.join(elements)}</svg>"
+    )
+
+
+def _svg_from_paths(paths: list, all_coords: list, pad: float = CONTENT_PADDING) -> Optional[str]:
     """Build SVG string with viewBox computed from actual content bounds."""
     if not paths or not all_coords:
         return None
 
-    xs = [c[0] for c in all_coords]
-    ys = [c[1] for c in all_coords]
-    min_x = min(xs) - CONTENT_PADDING
-    min_y = min(ys) - CONTENT_PADDING
-    w = max(xs) - min_x + CONTENT_PADDING
-    h = max(ys) - min_y + CONTENT_PADDING
-
-    return (
-        f'<?xml version="1.0" encoding="UTF-8"?>'
-        f'<svg xmlns="http://www.w3.org/2000/svg" '
-        f'viewBox="{min_x:.0f} {min_y:.0f} {w:.0f} {h:.0f}" '
-        f'width="{w:.0f}" height="{h:.0f}">'
-        f"{''.join(paths)}</svg>"
-    )
+    min_x, min_y, w, h = _crop_box(all_coords, pad)
+    return _svg_document(paths, (min_x, min_y, w, h), w, h)
 
 
 def _render_rm_v5_to_svg(rm_file_path: Path) -> Optional[str]:
@@ -474,15 +496,6 @@ def _render_rm_v5_to_svg(rm_file_path: Path) -> Optional[str]:
     """
     import struct
 
-    # Pen IDs that are highlighters (both old and v5 mappings)
-    HIGHLIGHTER_PENS = {5, 18}
-    # Pen IDs that are erasers — skip rendering
-    ERASER_PENS = {6, 7, 8}
-
-    # Color mapping by pen type
-    STROKE_COLORS = {0: "black", 1: "gray", 2: "white"}
-    HIGHLIGHT_COLORS = {0: "#FFD700", 1: "#FFD700", 2: "#FFD700"}
-
     try:
         with open(rm_file_path, "rb") as f:
             header = f.read(43)
@@ -490,8 +503,7 @@ def _render_rm_v5_to_svg(rm_file_path: Path) -> Optional[str]:
                 return None
 
             nlayers = struct.unpack("<I", f.read(4))[0]
-            paths = []
-            all_coords = []
+            items: List[_ink.InkItem] = []
 
             for _ in range(nlayers):
                 nstrokes = struct.unpack("<I", f.read(4))[0]
@@ -502,41 +514,66 @@ def _render_rm_v5_to_svg(rm_file_path: Path) -> Optional[str]:
                     segments = []
                     for _ in range(nsegments):
                         x, y, speed, tilt, width, pressure = struct.unpack("<ffffff", f.read(24))
-                        segments.append((x, y, width, pressure))
+                        segments.append((x, y, width, pressure, speed))
 
                     if not segments:
                         continue
 
-                    # Skip eraser strokes
-                    if pen in ERASER_PENS:
+                    # v5 highlighters were yellow only; their colour ids 0-2 are
+                    # the pen colour slots, not the highlight colour.
+                    if _ink.tool_name(pen) == "highlighter" and color in (0, 1, 2):
+                        color = 3  # PenColor.YELLOW
+                    # v5 floats are raw values: widths are already stroke units
+                    # (no /4); pressure is 0-1 and speed is unscaled, so scale
+                    # them the way rmscene scales the same float point format.
+                    style = _ink.style_for(
+                        pen,
+                        color,
+                        point_widths=[s[2] for s in segments],
+                        pressures=[s[3] * 255 for s in segments],
+                        speeds=[s[4] * 4 for s in segments],
+                        width_divisor=1.0,
+                    )
+                    if style.is_eraser:
                         continue
-
-                    is_highlighter = pen in HIGHLIGHTER_PENS
-                    if is_highlighter:
-                        stroke_color = HIGHLIGHT_COLORS.get(color, "#FFD700")
-                        avg_width = sum(s[2] for s in segments) / len(segments)
-                        stroke_width = max(10.0, min(avg_width * 2.0, 40.0))
-                        opacity = ' opacity="0.35"'
-                    else:
-                        stroke_color = STROKE_COLORS.get(color, "black")
-                        avg_width = sum(s[2] for s in segments) / len(segments)
-                        stroke_width = max(0.5, min(avg_width * 0.8, 5.0))
-                        opacity = ""
-
-                    d = f"M {segments[0][0]:.1f} {segments[0][1]:.1f}"
-                    d += "".join(f" L {s[0]:.1f} {s[1]:.1f}" for s in segments[1:])
-                    all_coords.extend((s[0], s[1]) for s in segments)
-
-                    paths.append(
-                        f'<path d="{d}" stroke="{stroke_color}" '
-                        f'stroke-width="{stroke_width:.1f}" '
-                        f'fill="none" stroke-linecap="round" '
-                        f'stroke-linejoin="round"{opacity}/>'
+                    items.append(
+                        _ink.InkItem(
+                            kind="stroke",
+                            style=style,
+                            order=len(items),
+                            points=[(s[0], s[1]) for s in segments],
+                        )
                     )
 
-        return _svg_from_paths(paths, all_coords)
+        highlights, ink, coords, max_half = _layer_elements(items)
+        return _svg_from_paths(highlights + ink, coords, CONTENT_PADDING + max_half)
     except Exception:
         return None
+
+
+def _layer_elements(items: List["_ink.InkItem"]) -> Tuple[list, list, list, float]:
+    """Split items into highlight and ink SVG elements.
+
+    Highlights (highlighter, shader, text highlights) come first: they blend
+    with multiply, which on the device looks the same whatever the stacking
+    order, and drawing them under the ink keeps ink and text dark in renderers
+    without blend support. Returns ``(highlights, ink, coords, max_half_width)``
+    with coords in the same order as the elements.
+    """
+    highlights: list = []
+    ink: list = []
+    hl_coords: list = []
+    ink_coords: list = []
+    max_half = 0.0
+    for item in items:
+        if item.style.is_highlight:
+            highlights.extend(_ink.svg_elements(item))
+            hl_coords.extend(item.coords())
+        else:
+            ink.extend(_ink.svg_elements(item))
+            ink_coords.extend(item.coords())
+        max_half = max(max_half, item.style.width / 2.0)
+    return highlights, ink, hl_coords + ink_coords, max_half
 
 
 def _v6_blocks(rm_file_path: Path) -> Optional[list]:
@@ -645,96 +682,23 @@ def _v6_paths_from_blocks(blocks: list, anchor_pos: Optional[dict] = None) -> Tu
     device draws them. Without it strokes render at their stored coordinates,
     which for anchored groups is on top of the typed text block.
     """
-    # Integer pen/color values (rmscene exposes ints on blocks).
-    HIGHLIGHTER_PENS = {5, 18}  # HIGHLIGHTER_1, HIGHLIGHTER_2
-    ERASER_PENS = {6, 8}  # ERASER, ERASER_AREA
-    COLOR_MAP = {
-        0: "black",  # BLACK
-        1: "#808080",  # GRAY
-        2: "white",  # WHITE
-        3: "#FFD700",  # YELLOW
-        4: "#00A000",  # GREEN
-        5: "#FF69B4",  # PINK
-        6: "#4169E1",  # BLUE
-        7: "#E00000",  # RED
-        8: "#A0A0A0",  # GRAY_OVERLAP
-        9: "#FFD700",  # HIGHLIGHT
-        10: "#00C000",  # GREEN_2
-        11: "#00CED1",  # CYAN
-        12: "#FF00FF",  # MAGENTA
-        13: "#FFD700",  # YELLOW_2
-    }
+    highlights, ink, coords, _ = _v6_layers(blocks, anchor_pos)
+    return highlights + ink, coords
 
+
+def _v6_items(blocks: list, anchor_pos: Optional[dict] = None) -> List["_ink.InkItem"]:
+    """Strokes and text highlights of a v6 page, with text-anchored ink moved."""
     group_offsets = _v6_group_offsets(blocks, anchor_pos) if anchor_pos else {}
+    return _ink.scene_items(blocks, group_offsets)
 
-    paths: list = []
-    all_coords: list = []
-    for block in blocks:
-        if not hasattr(block, "item") or not hasattr(block.item, "value"):
-            continue
-        line = block.item.value
-        dx, dy = group_offsets.get(getattr(block, "parent_id", None), (0.0, 0.0))
 
-        # Text highlights are GlyphRange items: they carry `rectangles`
-        # (highlight boxes over selected text) rather than stroke `points`.
-        # Emit a translucent filled rect per rectangle in the highlight colour.
-        if getattr(line, "rectangles", None):
-            hl_color = getattr(line, "color", 9)
-            hl_color = hl_color.value if hasattr(hl_color, "value") else hl_color
-            hl_fill = COLOR_MAP.get(hl_color, "#FFD700")
-            for r in line.rectangles:
-                paths.append(
-                    f'<rect x="{r.x + dx:.1f}" y="{r.y + dy:.1f}" '
-                    f'width="{r.w:.1f}" height="{r.h:.1f}" '
-                    f'fill="{hl_fill}" opacity="0.35" stroke="none"/>'
-                )
-                all_coords.append((r.x + dx, r.y + dy))
-                all_coords.append((r.x + dx + r.w, r.y + dy + r.h))
-            continue
+def _v6_layers(blocks: list, anchor_pos: Optional[dict] = None) -> Tuple[list, list, list, float]:
+    """``(highlight_elements, ink_elements, coords, max_half_width)`` of a page.
 
-        if not hasattr(line, "points") or not line.points:
-            continue
-
-        tool = line.tool if hasattr(line, "tool") else None
-        color = line.color if hasattr(line, "color") else 0
-        # Convert enums to int if needed
-        tool = tool.value if hasattr(tool, "value") else tool
-        color = color.value if hasattr(color, "value") else color
-
-        if tool in ERASER_PENS:
-            continue
-
-        is_highlighter = tool in HIGHLIGHTER_PENS
-        stroke_color = COLOR_MAP.get(color, "black")
-
-        if is_highlighter:
-            avg_width = (
-                sum(p.width for p in line.points) / len(line.points)
-                if all(hasattr(p, "width") for p in line.points)
-                else 20.0
-            )
-            stroke_width = max(10.0, min(avg_width * 2.0, 40.0))
-            opacity = ' opacity="0.35"'
-        else:
-            avg_width = (
-                sum(p.width for p in line.points) / len(line.points)
-                if all(hasattr(p, "width") for p in line.points)
-                else 2.0
-            )
-            stroke_width = max(0.5, min(avg_width * 0.8, 5.0))
-            opacity = ""
-
-        d = f"M {line.points[0].x + dx:.1f} {line.points[0].y + dy:.1f}"
-        d += "".join(f" L {p.x + dx:.1f} {p.y + dy:.1f}" for p in line.points[1:])
-        all_coords.extend((p.x + dx, p.y + dy) for p in line.points)
-
-        paths.append(
-            f'<path d="{d}" stroke="{stroke_color}" '
-            f'stroke-width="{stroke_width:.1f}" '
-            f'fill="none" stroke-linecap="round" '
-            f'stroke-linejoin="round"{opacity}/>'
-        )
-    return paths, all_coords
+    Colour, width, opacity and blend come from :mod:`remarkable_mcp.ink`, the
+    one style source every output format shares. Erasers are not drawn.
+    """
+    return _layer_elements(_v6_items(blocks, anchor_pos))
 
 
 # reMarkable typed-text layout, in raw stroke units. Calibrated against
@@ -927,13 +891,47 @@ def _render_rm_v6_to_svg(rm_file_path: Path) -> Optional[str]:
     if blocks is None:
         return None
     try:
-        text_elements, text_coords, anchor_pos = _v6_text_elements_with_bounds(blocks)
-        paths, all_coords = _v6_paths_from_blocks(blocks, anchor_pos)
-        # Typed text is drawn under strokes (handwriting layers on top), and its
-        # extent is folded into the crop so a text-only page still renders.
-        return _svg_from_paths(text_elements + paths, all_coords + text_coords)
+        parts = _v6_page_parts(blocks)
+        # Highlights first (they multiply), then typed text, then handwriting.
+        # The text extent is folded into the crop so a text-only page renders.
+        return _svg_from_paths(parts.elements, parts.coords, CONTENT_PADDING + parts.max_half)
     except Exception:
         return None
+
+
+class _PageParts(NamedTuple):
+    highlights: list
+    text: list
+    ink: list
+    coords: list
+    max_half: float
+    items: list
+    paper: Tuple[float, float]
+
+    @property
+    def elements(self) -> list:
+        return self.highlights + self.text + self.ink
+
+    @property
+    def foreground(self) -> list:
+        """Typed text plus handwriting: everything drawn over the highlights."""
+        return self.text + self.ink
+
+
+def _v6_page_parts(blocks: list) -> _PageParts:
+    """Everything needed to draw one v6 page, split into blend layers."""
+    text_elements, text_coords, anchor_pos = _v6_text_elements_with_bounds(blocks)
+    items = _v6_items(blocks, anchor_pos)
+    highlights, ink, coords, max_half = _layer_elements(items)
+    return _PageParts(
+        highlights,
+        text_elements,
+        ink,
+        coords + text_coords,
+        max_half,
+        items,
+        _v6_paper_size(blocks),
+    )
 
 
 def render_rm_file_to_png(
@@ -954,13 +952,35 @@ def render_rm_file_to_png(
     Returns:
         PNG image bytes, or None if rendering failed
     """
+    blocks = _v6_blocks(rm_file_path)
+    if blocks is not None:
+        try:
+            parts = _v6_page_parts(blocks)
+            if not parts.elements or not parts.coords:
+                return None
+            min_x, min_y, w, h = _crop_box(parts.coords, CONTENT_PADDING + parts.max_half)
+            m = CONTENT_MARGIN
+            # The PNG keeps a CONTENT_MARGIN border on every side; widening the
+            # viewBox by the same amount keeps 1 px per stroke unit (no stretch).
+            return _render_ink_layers_png(
+                parts.highlights,
+                parts.foreground,
+                (min_x - m, min_y - m, w + 2 * m, h + 2 * m),
+                w + 2 * m,
+                h + 2 * m,
+                background_color=background_color,
+            )
+        except Exception as exc:
+            logger.debug("Cropped v6 render failed: %s", exc)
+            return None
+
     tmp_svg_path = None
 
     try:
         with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as tmp_svg:
             tmp_svg_path = Path(tmp_svg.name)
 
-        # Convert .rm to SVG via the rmscene renderers
+        # Convert .rm to SVG via the rmscene renderers (v5 files)
         if not _rm_to_svg(rm_file_path, tmp_svg_path):
             return None
 
@@ -1008,10 +1028,8 @@ def _svg_full_page(paths: list, paper_w: float, paper_h: float) -> str:
     )
 
 
-def _svg_string_to_png(
-    svg: str, output_width: int, output_height: int, background_color: Optional[str]
-) -> Optional[bytes]:
-    """Rasterize an SVG string to exact-size PNG bytes without system Cairo."""
+def _svg_string_to_image(svg: str, output_width: int, output_height: int):
+    """Rasterize an SVG string to an exact-size RGBA PIL image, or None."""
     import io
 
     try:
@@ -1053,17 +1071,7 @@ def _svg_string_to_png(
         image = PILImage.open(io.BytesIO(png)).convert("RGBA")
         if image.size != (output_width, output_height):
             image = image.resize((output_width, output_height), PILImage.Resampling.LANCZOS)
-
-        if background_color is not None:
-            red, green, blue, alpha = _parse_hex_color(background_color)
-            background = PILImage.new("RGBA", image.size, (red, green, blue, alpha))
-            image = PILImage.alpha_composite(background, image)
-            if alpha == 255:
-                image = image.convert("RGB")
-
-        output = io.BytesIO()
-        image.save(output, format="PNG")
-        return output.getvalue()
+        return image
     except Exception as exc:
         logger.error(
             "PyMuPDF could not rasterize SVG to PNG (%sx%s): %s",
@@ -1075,6 +1083,128 @@ def _svg_string_to_png(
     finally:
         if doc is not None:
             doc.close()
+
+
+def _svg_string_to_png(
+    svg: str, output_width: int, output_height: int, background_color: Optional[str]
+) -> Optional[bytes]:
+    """Rasterize an SVG string to exact-size PNG bytes without system Cairo."""
+    import io
+
+    image = _svg_string_to_image(svg, output_width, output_height)
+    if image is None:
+        return None
+
+    from PIL import Image as PILImage
+
+    background = _background_rgba(background_color)
+    if background is not None:
+        canvas = PILImage.new("RGBA", image.size, background)
+        image = PILImage.alpha_composite(canvas, image)
+        if background[3] == 255:
+            image = image.convert("RGB")
+
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
+def _background_rgba(color: Optional[str]) -> Optional[Tuple[int, int, int, int]]:
+    """RGBA for a background colour; None (no background) for transparent."""
+    if color is None:
+        return None
+    if str(color).strip().lower() in ("", "none", "transparent"):
+        return None
+    return _parse_hex_color(color)
+
+
+def _render_ink_layers(
+    highlights: list,
+    foreground: list,
+    viewbox: Tuple[float, float, float, float],
+    width: float,
+    height: float,
+    *,
+    background_color: Optional[str] = None,
+    base_image=None,
+):
+    """Composite a page's highlight and ink layers into an RGBA image.
+
+    MuPDF's SVG renderer ignores ``mix-blend-mode``, so the highlight layer is
+    rasterised on its own and multiplied onto the base (paper colour or the PDF
+    page): paper takes the highlight's tint while text and ink underneath stay
+    dark, as on the device. Typed text and handwriting are then alpha-composited
+    on top. On a transparent base there is nothing to multiply with, so the
+    highlights are alpha-composited instead. Returns None if rasterising fails.
+    """
+    from PIL import Image as PILImage
+    from PIL import ImageChops
+
+    width = max(1, int(round(width)))
+    height = max(1, int(round(height)))
+    if base_image is not None:
+        base = base_image.convert("RGBA")
+        if base.size != (width, height):
+            base = base.resize((width, height), PILImage.Resampling.LANCZOS)
+    else:
+        base = PILImage.new(
+            "RGBA", (width, height), _background_rgba(background_color) or (0, 0, 0, 0)
+        )
+
+    if highlights:
+        layer = _svg_string_to_image(
+            _svg_document(highlights, viewbox, width, height), width, height
+        )
+        if layer is None:
+            return None
+        if base.getchannel("A").getextrema()[0] == 255:
+            white = PILImage.new("RGBA", layer.size, (255, 255, 255, 255))
+            tint = PILImage.alpha_composite(white, layer).convert("RGB")
+            base = ImageChops.multiply(base.convert("RGB"), tint).convert("RGBA")
+        else:
+            base = PILImage.alpha_composite(base, layer)
+
+    if foreground:
+        layer = _svg_string_to_image(
+            _svg_document(foreground, viewbox, width, height), width, height
+        )
+        if layer is None:
+            return None
+        base = PILImage.alpha_composite(base, layer)
+    return base
+
+
+def _encode_png(image) -> bytes:
+    """PNG bytes; fully opaque images are stored as RGB."""
+    import io
+
+    if image.mode == "RGBA" and image.getchannel("A").getextrema()[0] == 255:
+        image = image.convert("RGB")
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
+def _render_ink_layers_png(
+    highlights: list,
+    foreground: list,
+    viewbox: Tuple[float, float, float, float],
+    width: float,
+    height: float,
+    *,
+    background_color: Optional[str] = None,
+    base_image=None,
+) -> Optional[bytes]:
+    image = _render_ink_layers(
+        highlights,
+        foreground,
+        viewbox,
+        width,
+        height,
+        background_color=background_color,
+        base_image=base_image,
+    )
+    return _encode_png(image) if image is not None else None
 
 
 def render_rm_file_full_page_png(
@@ -1096,20 +1226,25 @@ def render_rm_file_full_page_png(
     if blocks is None:
         return None
     try:
-        text_elements, _, anchor_pos = _v6_text_elements_with_bounds(blocks)
-        paths, _ = _v6_paths_from_blocks(blocks, anchor_pos)
-        paper_w, paper_h = _v6_paper_size(blocks)
+        parts = _v6_page_parts(blocks)
+        paper_w, paper_h = parts.paper
     except Exception:
         return None
 
-    # Typed text is drawn first so handwritten strokes layer on top of it,
-    # matching the device's compositing order.
-    svg = _svg_full_page(text_elements + paths, paper_w, paper_h)
+    # Highlights multiply onto the paper; typed text and then handwriting are
+    # drawn on top, matching the device's compositing order.
     scale = FULL_PAGE_TARGET_LONG_EDGE / max(paper_w, paper_h)
     output_width = max(1, round(paper_w * scale))
     output_height = max(1, round(paper_h * scale))
 
-    png = _svg_string_to_png(svg, output_width, output_height, background_color)
+    png = _render_ink_layers_png(
+        parts.highlights,
+        parts.foreground,
+        (-paper_w / 2.0, 0.0, paper_w, paper_h),
+        output_width,
+        output_height,
+        background_color=background_color,
+    )
     if png is None:
         return None
     return png, (paper_w, paper_h)
@@ -1300,8 +1435,210 @@ def _select_rm_file_for_page(tmpdir_path: Path, rm_files: List[Path], page: int)
     return None
 
 
+def _source_pdf_path(tmpdir_path: Path) -> Optional[Path]:
+    """The archive's source PDF, preferring the one named after the document."""
+    pdf_files = list(tmpdir_path.glob("**/*.pdf"))
+    if not pdf_files:
+        return None
+    content_stems = {p.stem for p in tmpdir_path.glob("*.content")}
+    matching = [p for p in pdf_files if p.stem in content_stems]
+    return matching[0] if matching else sorted(pdf_files)[0]
+
+
+def _page_geometry(
+    tmpdir_path: Path,
+    page: int,
+    blocks: Optional[list],
+    paper_hint: Optional[Tuple[float, float]] = None,
+) -> "_ink.PageGeometry":
+    """Geometry of a page: its mapped PDF page when it has one, else the paper.
+
+    Uses the same scale and centring as the merged compositor, so coordinates
+    and full-page renders line up with the PDF exactly.
+    """
+    if blocks is not None:
+        paper = _v6_paper_size(blocks)
+    else:
+        paper = paper_hint or (float(REMARKABLE_WIDTH), float(REMARKABLE_HEIGHT))
+    ppu = _points_per_unit(paper)
+
+    pdf_path = _source_pdf_path(tmpdir_path)
+    if pdf_path is not None:
+        index = _resolve_pdf_page_index(tmpdir_path, page)
+        if index is not None:
+            try:
+                import fitz
+
+                with fitz.open(pdf_path) as doc:
+                    if 0 <= index < len(doc):
+                        rect = doc[index].rect
+                        return _ink.PageGeometry("pdf", rect.width, rect.height, ppu, index)
+            except Exception as exc:
+                logger.debug("Could not read PDF page geometry: %s", exc)
+    return _ink.PageGeometry("notebook", paper[0] * ppu, paper[1] * ppu, ppu, None)
+
+
+def _full_page_viewbox(
+    geometry: "_ink.PageGeometry", parts: Optional[_PageParts]
+) -> Tuple[float, float, float, float]:
+    """Full-page viewBox in stroke units: the page (the PDF page, or the
+    notebook paper), grown to include any ink drawn beside or below it, so
+    annotation-only output never hides margin notes or scrolled ink. The page
+    rectangle itself is reported on the SVG root (``data-page-rm-viewbox``).
+    """
+    x, y, w, h = geometry.viewbox
+    if parts is not None and parts.coords:
+        cx, cy, cw, ch = _crop_box(parts.coords, CONTENT_PADDING + parts.max_half)
+        x0, y0 = min(x, cx), min(y, cy)
+        x1, y1 = max(x + w, cx + cw), max(y + h, cy + ch)
+        return x0, y0, x1 - x0, y1 - y0
+    return x, y, w, h
+
+
+def _empty_parts(paper: Tuple[float, float]) -> _PageParts:
+    return _PageParts([], [], [], [], 0.0, [], paper)
+
+
+def _resolve_page_render(
+    tmpdir_path: Path, page: int, full_page: Optional[bool]
+) -> Tuple[Optional[Path], Optional[list], Optional["_ink.PageGeometry"], bool]:
+    """Pick the page's .rm, its blocks, its geometry and whether to render full.
+
+    ``full_page=None`` means "full page for PDF-backed pages, cropped to the
+    ink otherwise".
+    """
+    rm_files = _get_ordered_rm_files(tmpdir_path)
+    rm_file = _select_rm_file_for_page(tmpdir_path, rm_files, page)
+    blocks = _v6_blocks(rm_file) if rm_file is not None else None
+    if full_page is False:
+        return rm_file, blocks, None, False
+    geometry = _page_geometry(tmpdir_path, page, blocks, paper_hint=_document_paper_size(rm_files))
+    want_full = geometry.kind == "pdf" if full_page is None else True
+    return rm_file, blocks, geometry, want_full
+
+
+def _geometry_root_attrs(geometry: "_ink.PageGeometry") -> str:
+    attrs = (
+        f' data-geometry="{geometry.kind}"'
+        f' data-points-per-unit="{geometry.points_per_unit:.6g}"'
+        f' data-page-width-pt="{_ink._fmt(geometry.width_pt)}"'
+        f' data-page-height-pt="{_ink._fmt(geometry.height_pt)}"'
+        f' data-page-rm-viewbox="{" ".join(_ink._fmt(v) for v in geometry.viewbox)}"'
+    )
+    if geometry.pdf_page_index is not None:
+        attrs += f' data-pdf-page-index="{geometry.pdf_page_index}"'
+    return attrs
+
+
+def render_page_svg_from_extracted_document(
+    tmpdir_path: Path,
+    page: int = 1,
+    background_color: Optional[str] = None,
+    full_page: Optional[bool] = False,
+) -> Optional[str]:
+    """Render one page's annotation layer to SVG.
+
+    ``full_page=False`` crops to the ink (the historical behaviour). ``True``
+    renders the whole page plus any ink beyond it (see
+    :func:`_full_page_viewbox`); for a PDF-backed page ``width``/``height`` are
+    that extent in PDF points (unitless numbers), and ``data-*`` attributes on
+    the root give the scale and the page rectangle. ``None`` picks full page
+    for PDF-backed pages and the ink crop otherwise.
+    """
+    rm_file, blocks, geometry, want_full = _resolve_page_render(tmpdir_path, page, full_page)
+    if rm_file is None:
+        return None
+    if not want_full or blocks is None or geometry is None:
+        # Cropped render (v5 files have no page geometry and always crop).
+        return render_rm_file_to_svg(rm_file, background_color=background_color)
+
+    parts = _v6_page_parts(blocks)
+    viewbox = _full_page_viewbox(geometry, parts)
+    if geometry.kind == "pdf":
+        width = viewbox[2] * geometry.points_per_unit
+        height = viewbox[3] * geometry.points_per_unit
+    else:
+        width, height = viewbox[2], viewbox[3]
+    svg = _svg_document(parts.elements, viewbox, width, height, _geometry_root_attrs(geometry))
+    if background_color:
+        svg = _add_svg_background(svg, background_color)
+    return svg
+
+
+def render_page_png_from_extracted_document(
+    tmpdir_path: Path,
+    page: int = 1,
+    background_color: Optional[str] = None,
+    full_page: Optional[bool] = False,
+) -> Optional[bytes]:
+    """Render one page's annotation layer to PNG (see the SVG twin for
+    ``full_page``). Full-page PDF renders use 2 px per PDF point, like the
+    merged view; full-page notebook renders use the full-page canvas scale.
+    """
+    rm_file, blocks, geometry, want_full = _resolve_page_render(tmpdir_path, page, full_page)
+    if rm_file is None:
+        return None
+    if not want_full or blocks is None or geometry is None:
+        return render_rm_file_to_png(rm_file, background_color=background_color)
+
+    parts = _v6_page_parts(blocks)
+    viewbox = _full_page_viewbox(geometry, parts)
+    if geometry.kind == "pdf":
+        scale = 2.0 * geometry.points_per_unit
+    else:
+        scale = FULL_PAGE_TARGET_LONG_EDGE / max(parts.paper)
+    return _render_ink_layers_png(
+        parts.highlights,
+        parts.foreground,
+        viewbox,
+        viewbox[2] * scale,
+        viewbox[3] * scale,
+        background_color=background_color,
+    )
+
+
+def render_page_annotation_layer_from_extracted_document(
+    tmpdir_path: Path, page: int = 1, background_color: Optional[str] = None
+) -> Optional[Tuple[bytes, Tuple[float, float]]]:
+    """Full-page annotation layer for exports.
+
+    A PDF-backed page renders on its PDF page (2 px per point, so the exported
+    page keeps the PDF's size and no ink is clipped by the paper grid). Other
+    pages use :func:`render_page_full_page_from_extracted_document`.
+    """
+    rm_files = _get_ordered_rm_files(tmpdir_path)
+    rm_file = _select_rm_file_for_page(tmpdir_path, rm_files, page)
+    blocks = _v6_blocks(rm_file) if rm_file is not None else None
+    geometry = _page_geometry(tmpdir_path, page, blocks, paper_hint=_document_paper_size(rm_files))
+    if geometry.kind != "pdf" or (rm_file is not None and blocks is None):
+        return render_page_full_page_from_extracted_document(
+            tmpdir_path, page=page, background_color=background_color
+        )
+
+    parts = _v6_page_parts(blocks) if blocks is not None else _empty_parts((0.0, 0.0))
+    png = _render_ink_layers_png(
+        parts.highlights,
+        parts.foreground,
+        geometry.viewbox,
+        geometry.width_pt * 2.0,
+        geometry.height_pt * 2.0,
+        background_color=background_color,
+    )
+    if png is None:
+        return None
+    return png, (geometry.width_pt, geometry.height_pt)
+
+
+def _extract_zip(zip_path: Path, tmpdir_path: Path) -> None:
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(tmpdir_path)
+
+
 def render_page_from_document_zip_svg(
-    zip_path: Path, page: int = 1, background_color: Optional[str] = None
+    zip_path: Path,
+    page: int = 1,
+    background_color: Optional[str] = None,
+    full_page: Optional[bool] = False,
 ) -> Optional[str]:
     """
     Render a specific page from a reMarkable document zip to SVG.
@@ -1311,29 +1648,25 @@ def render_page_from_document_zip_svg(
         page: Page number (1-indexed)
         background_color: Background color (e.g., "#FFFFFF", None for transparent).
                          Use REMARKABLE_BACKGROUND_COLOR for the standard paper color.
+        full_page: False crops to the ink, True renders the whole page, None
+                   renders PDF-backed pages full page and crops the rest.
 
     Returns:
         SVG content as string, or None if rendering failed or page doesn't exist
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
-
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(tmpdir_path)
-
-        rm_files = _get_ordered_rm_files(tmpdir_path)
-
-        # Select the page's .rm by id (see _select_rm_file_for_page); None means
-        # the page has no annotation layer.
-        target_rm_file = _select_rm_file_for_page(tmpdir_path, rm_files, page)
-        if target_rm_file is None:
-            return None
-
-        return render_rm_file_to_svg(target_rm_file, background_color=background_color)
+        _extract_zip(zip_path, tmpdir_path)
+        return render_page_svg_from_extracted_document(
+            tmpdir_path, page, background_color=background_color, full_page=full_page
+        )
 
 
 def render_page_from_document_zip(
-    zip_path: Path, page: int = 1, background_color: Optional[str] = None
+    zip_path: Path,
+    page: int = 1,
+    background_color: Optional[str] = None,
+    full_page: Optional[bool] = False,
 ) -> Optional[bytes]:
     """
     Render a specific page from a reMarkable document zip to PNG.
@@ -1343,25 +1676,132 @@ def render_page_from_document_zip(
         page: Page number (1-indexed)
         background_color: Background color (e.g., "#FFFFFF", None for transparent).
                          Use REMARKABLE_BACKGROUND_COLOR for the standard paper color.
+        full_page: False crops to the ink, True renders the whole page, None
+                   renders PDF-backed pages full page and crops the rest.
 
     Returns:
         PNG image bytes, or None if rendering failed or page doesn't exist
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
+        _extract_zip(zip_path, tmpdir_path)
+        return render_page_png_from_extracted_document(
+            tmpdir_path, page, background_color=background_color, full_page=full_page
+        )
 
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(tmpdir_path)
+
+def _render_items_crop_png(
+    items: List["_ink.InkItem"],
+    box: Tuple[float, float, float, float],
+    px_per_unit: float = 2.0,
+    pad: float = CONTENT_PADDING,
+) -> Optional[bytes]:
+    """Render a few strokes, cropped to ``box`` (x0, y0, x1, y1), on white."""
+    elements: list = []
+    for item in items:
+        elements.extend(_ink.svg_elements(item))
+    viewbox = (box[0] - pad, box[1] - pad, box[2] - box[0] + 2 * pad, box[3] - box[1] + 2 * pad)
+    return _render_ink_layers_png(
+        [],
+        elements,
+        viewbox,
+        viewbox[2] * px_per_unit,
+        viewbox[3] * px_per_unit,
+        background_color="#FFFFFF",
+    )
+
+
+#: OCR runs on at most this many ink clusters per call.
+MAX_OCR_CLUSTERS = 40
+
+
+def extract_page_ink_metadata(
+    zip_path: Path,
+    page: int = 1,
+    *,
+    include_strokes: bool = True,
+    cluster_gap_pt: Optional[float] = 8.0,
+    ocr=None,
+    stroke_offset: int = 0,
+    max_strokes: int = _ink.DEFAULT_MAX_STROKES,
+) -> Dict[str, Any]:
+    """Colour, tool and position of every stroke and text highlight on a page.
+
+    Coordinates are PDF points with a top-left origin (see
+    :class:`remarkable_mcp.ink.PageGeometry`) plus the raw stroke coordinates.
+    The per-stroke list is paged by ``stroke_offset``/``max_strokes``.
+    ``ocr``, when given, is called with PNG bytes for each ink cluster (up to
+    :data:`MAX_OCR_CLUSTERS`, highlighters excluded) and its text is attached.
+    Raises ``ValueError`` for a page outside the document.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        _extract_zip(zip_path, tmpdir_path)
 
         rm_files = _get_ordered_rm_files(tmpdir_path)
+        page_order = _get_page_order(tmpdir_path)
+        total = len(page_order) or len(rm_files)
+        if page < 1 or page > total:
+            raise ValueError(f"Page {page} out of range (document has {total} pages).")
 
-        # Select the page's .rm by id (see _select_rm_file_for_page); None means
-        # the page has no annotation layer.
-        target_rm_file = _select_rm_file_for_page(tmpdir_path, rm_files, page)
-        if target_rm_file is None:
-            return None
+        rm_file = _select_rm_file_for_page(tmpdir_path, rm_files, page)
+        blocks = _v6_blocks(rm_file) if rm_file is not None else None
+        geometry = _page_geometry(
+            tmpdir_path, page, blocks, paper_hint=_document_paper_size(rm_files)
+        )
+        result: Dict[str, Any] = {
+            "page": page,
+            "total_pages": total,
+            "page_id": page_order[page - 1] if page_order else (rm_file.stem if rm_file else None),
+        }
 
-        return render_rm_file_to_png(target_rm_file, background_color=background_color)
+        if rm_file is None or blocks is None:
+            result.update(
+                _ink.page_metadata(
+                    [], geometry, include_strokes=include_strokes, cluster_gap_pt=cluster_gap_pt
+                )
+            )
+            result["note"] = (
+                "This page has no annotation layer."
+                if rm_file is None
+                else "This page uses the legacy v5 format; stroke metadata needs firmware 3.x."
+            )
+            return result
+
+        _, _, anchor_pos = _v6_text_elements_with_bounds(blocks)
+        group_offsets = _v6_group_offsets(blocks, anchor_pos) if anchor_pos else {}
+        all_items = _ink.scene_items(blocks, group_offsets, include_erasers=True)
+        items = [it for it in all_items if not it.style.is_eraser]
+        meta = _ink.page_metadata(
+            items,
+            geometry,
+            include_strokes=include_strokes,
+            cluster_gap_pt=cluster_gap_pt,
+            erasers=len(all_items) - len(items),
+            stroke_offset=stroke_offset,
+            max_strokes=max_strokes,
+        )
+
+        clusters = meta.get("clusters") or []
+        if ocr is not None and clusters:
+            stroke_items = [it for it in items if it.kind == "stroke"]
+            text_clusters = [c for c in clusters if c["tool"] not in _ink.HIGHLIGHT_TOOLS]
+            for cluster in text_clusters[:MAX_OCR_CLUSTERS]:
+                members = [stroke_items[i] for i in cluster["stroke_indexes"]]
+                box = _ink.union_box(m.bbox for m in members)
+                png = _render_items_crop_png(members, box)
+                try:
+                    cluster["ocr_text"] = ocr(png) if png else None
+                except Exception as exc:
+                    logger.debug("Cluster OCR failed: %s", exc)
+                    cluster["ocr_text"] = None
+            if len(text_clusters) > MAX_OCR_CLUSTERS:
+                meta["ocr_note"] = (
+                    f"OCR ran on the first {MAX_OCR_CLUSTERS} of {len(text_clusters)} "
+                    "ink clusters (reading order)."
+                )
+        result.update(meta)
+        return result
 
 
 def _document_paper_size(rm_files: List[Path]) -> Tuple[float, float]:
@@ -1825,77 +2265,71 @@ def render_merged_page_from_extracted_document(
     if pdf_png is None:
         return annotation_only("PDF rasterization failed")
 
-    # 2. Render annotation layer to SVG, then to PNG with transparent background
-    ann_svg_path = None
-    ann_png_bytes = None
-
     try:
-        with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as tmp_svg:
-            ann_svg_path = Path(tmp_svg.name)
+        pdf_img = PILImage.open(io.BytesIO(pdf_png)).convert("RGBA")
+    except Exception:
+        return annotation_only("Compositing failed")
 
-        if target_rm_file is not None and _rm_to_svg(target_rm_file, ann_svg_path):
-            # rmscene coordinates use the device paper grid, not PDF points. Set
-            # the root viewBox to the calibrated page rectangle before rasterizing.
-            svg_content = ann_svg_path.read_text()
-
-            blocks = _v6_blocks(target_rm_file)
-            paper_size = _v6_paper_size(blocks) if blocks is not None else None
-            points_per_unit = _points_per_unit(paper_size)
+    # 2. Draw the annotation layer onto the PDF page. rmscene coordinates use
+    #    the device paper grid, not PDF points, so the viewBox is the calibrated
+    #    page rectangle. Highlights multiply onto the page (PDF text under a
+    #    highlight stays dark); handwriting is composited on top.
+    composite = pdf_img
+    ann_render_error: Optional[Exception] = None
+    try:
+        blocks = _v6_blocks(target_rm_file) if target_rm_file is not None else None
+        if blocks is not None:
+            parts = _v6_page_parts(blocks)
             viewbox = _annotation_page_viewbox(
-                pdf_w_pt,
-                pdf_h_pt,
-                points_per_unit,
-                centered_x=blocks is not None,
+                pdf_w_pt, pdf_h_pt, _points_per_unit(parts.paper), centered_x=True
             )
-            svg_content = _rewrite_svg_root(
-                svg_content,
-                viewbox=viewbox,
-                width=out_w,
-                height=out_h,
+            layered = _render_ink_layers(
+                parts.highlights, parts.foreground, viewbox, out_w, out_h, base_image=pdf_img
             )
-
-            ann_png_bytes = _svg_string_to_png(
-                svg_content,
-                out_w,
-                out_h,
-                None,
-            )
-            if ann_png_bytes is None:
+            if layered is None:
                 raise RuntimeError("PyMuPDF could not rasterize the annotation SVG")
+            composite = layered
+        elif target_rm_file is not None:
+            composite = _composite_v5_overlay(target_rm_file, pdf_img, pdf_w_pt, pdf_h_pt)
     except Exception as exc:
         # Annotation rendering failed; return the PDF page but expose the loss.
         logger.debug("Annotation overlay rendering failed: %s", exc)
         ann_render_error = exc
-    else:
-        ann_render_error = None
-    finally:
-        if ann_svg_path:
-            ann_svg_path.unlink(missing_ok=True)
+        composite = pdf_img
 
-    # 3. Composite: PDF base + annotation overlay
+    merged_note = (
+        "Annotation overlay failed to render; returned PDF page without annotations."
+        if ann_render_error is not None
+        else None
+    )
+
+    # 3. Encode
     try:
-        pdf_img = PILImage.open(io.BytesIO(pdf_png)).convert("RGBA")
-
-        if ann_png_bytes:
-            ann_img = PILImage.open(io.BytesIO(ann_png_bytes)).convert("RGBA")
-            if ann_img.size != pdf_img.size:
-                ann_img = ann_img.resize(pdf_img.size, PILImage.LANCZOS)
-            composite = PILImage.alpha_composite(pdf_img, ann_img)
-            merged_note = None
-        else:
-            composite = pdf_img
-            merged_note = (
-                "Annotation overlay failed to render; returned PDF page without annotations."
-                if ann_render_error is not None
-                else None
-            )
-
         composite = composite.convert("RGB")
         buf = io.BytesIO()
         composite.save(buf, format="PNG")
         return buf.getvalue(), merged_note
     except Exception:
         return annotation_only("Compositing failed")
+
+
+def _composite_v5_overlay(rm_file: Path, pdf_img, pdf_w_pt: float, pdf_h_pt: float):
+    """Alpha-composite a v5 (.lines) annotation layer onto a PDF page image."""
+    import io
+
+    from PIL import Image as PILImage
+
+    svg_content = _render_rm_v5_to_svg(rm_file)
+    if svg_content is None:
+        return pdf_img
+    out_w, out_h = pdf_img.size
+    viewbox = _annotation_page_viewbox(pdf_w_pt, pdf_h_pt, _points_per_unit(None), centered_x=False)
+    svg_content = _rewrite_svg_root(svg_content, viewbox=viewbox, width=out_w, height=out_h)
+    png = _svg_string_to_png(svg_content, out_w, out_h, None)
+    if png is None:
+        raise RuntimeError("PyMuPDF could not rasterize the annotation SVG")
+    overlay = PILImage.open(io.BytesIO(png)).convert("RGBA")
+    return PILImage.alpha_composite(pdf_img, overlay)
 
 
 def get_document_page_count(zip_path: Path) -> int:

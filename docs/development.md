@@ -37,11 +37,13 @@ remarkable-mcp/
 │   ├── usb_web.py          # USB web client
 │   ├── local_dir.py        # Desktop cache client
 │   ├── extract.py          # Text and image extraction
+│   ├── ink.py              # Ink palette, stroke style, page geometry, stroke metadata
 │   ├── markdown_pdf.py     # Markdown-to-PDF rendering
 │   └── app_canvas.py       # MCP Apps canvas
 ├── test_server.py
 ├── test_mcp_v2.py          # Modern/legacy protocol compatibility tests
 ├── test_page_mapping.py
+├── test_ink.py             # Ink colour/tool/geometry tests (fixtures: ink_fixtures.py)
 ├── test_local_dir.py
 ├── test_integration.py
 ├── smoke/

@@ -145,6 +145,11 @@ def resolve_tool(tool) -> int:
     if tool is None:
         return PEN_IDS[DEFAULT_TOOL]
     if isinstance(tool, int):
+        # Check membership explicitly: the read path lets Pen() accept unknown
+        # ids (see ink._tolerate_unknown_enum_values), which must never reach
+        # the tablet.
+        if tool not in Pen._value2member_map_:
+            raise ValueError(f"{tool} is not a valid Pen")
         return int(Pen(tool).value)
     key = str(tool).strip().lower().replace(" ", "_").replace("-", "_")
     if key in PEN_IDS:
@@ -161,6 +166,8 @@ def resolve_color(color) -> int:
     if color is None:
         return COLOR_IDS[DEFAULT_COLOR]
     if isinstance(color, int):
+        if color not in PenColor._value2member_map_:
+            raise ValueError(f"{color} is not a valid PenColor")
         return int(PenColor(color).value)
     key = str(color).strip().lower().replace(" ", "_").replace("-", "_")
     if key in COLOR_IDS:

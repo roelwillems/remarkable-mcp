@@ -16,9 +16,14 @@ class DateTimeEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
-def make_response(data: Dict[str, Any], hint: str) -> str:
-    """Create a JSON response with a hint for the model."""
+def make_response(data: Dict[str, Any], hint: str, *, compact: bool = False) -> str:
+    """Create a JSON response with a hint for the model.
+
+    ``compact`` drops indentation and spaces, for large structured payloads.
+    """
     data["_hint"] = hint
+    if compact:
+        return json.dumps(data, separators=(",", ":"), cls=DateTimeEncoder)
     return json.dumps(data, indent=2, cls=DateTimeEncoder)
 
 

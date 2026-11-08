@@ -13,6 +13,7 @@ This document describes the read and render tools. Write tools are listed in the
 | [`remarkable_recent`](#remarkable_recent) | Get recently modified documents |
 | [`remarkable_status`](#remarkable_status) | Check connection status |
 | [`remarkable_image`](#remarkable_image) | Get page images (PNG or SVG) |
+| [`remarkable_strokes`](#remarkable_strokes) | Ink colour, tool and position as JSON |
 | [`remarkable_export`](#remarkable_export) | Export one document as PDF or Markdown |
 
 These tools never modify tablet content and return structured next-step hints.
@@ -355,6 +356,27 @@ remarkable_status()
 | `include_ocr` | bool | `False` | Enable OCR on the image |
 | `compatibility` | bool | `False` | Return resource URI instead of embedded resource |
 | `render_merged` | bool \| null | `None` (auto) | PNG compositing mode: auto-merge PDF-backed pages, `True` to request merging explicitly, or `False` for annotations only |
+| `full_page` | bool \| null | `None` (auto) | Extent of annotation-only output: `None` renders PDF-backed pages as the whole PDF page (grown to include margin ink) and crops notebook pages to the ink; `True` always renders the whole page; `False` always crops to the ink |
+
+### Ink colours and tools
+
+Every render (SVG, PNG, merged PNG and PDF export) keeps the colour and tool of
+each stroke:
+
+- Pen colours come from rmc's reMarkable palette (black `#000000`, gray
+  `#909090`, white, yellow `#FBF719`, green `#00FF00`, pink `#FFC0CB`, blue
+  `#4E69C9`, red `#B33E39`, ...).
+- Highlighter, shader and text-highlight colours stored by firmware 3.14+ in
+  `color_rgba` are used as stored (for example yellow `#FFED75`, green `#ACFF85`).
+- A colour the server does not know renders magenta `#FF00FF` and is logged.
+- Width follows the stored point width (which includes the pen thickness).
+- Highlights blend with multiply: in PNGs, text and ink under a highlight stay
+  dark. In SVG, highlights carry `style="mix-blend-mode:multiply"` and a
+  translucent paint that gives the same colour on white paper; every element has
+  `data-tool`, `data-color` and `data-color-hex` (the stored colour).
+- A full-page SVG of a PDF-backed page carries `data-geometry`,
+  `data-points-per-unit`, `data-page-width-pt`, `data-page-height-pt` and
+  `data-page-rm-viewbox` on its root, so strokes can be mapped onto the PDF page.
 
 ### Background Colors
 
@@ -395,8 +417,14 @@ remarkable_image("Diagram", compatibility=True)
 # PDF-backed PNG pages merge the source page and annotations automatically
 remarkable_image("Research Paper", page=3)
 
-# Return only the reMarkable annotation layer
+# Return only the reMarkable annotation layer (whole PDF page by default)
 remarkable_image("Research Paper", page=3, render_merged=False)
+
+# Annotation layer cropped to the ink instead
+remarkable_image("Research Paper", page=3, render_merged=False, full_page=False)
+
+# Whole notebook page as SVG
+remarkable_image("Notes", output_format="svg", full_page=True)
 ```
 
 ### Response Format
@@ -422,7 +450,9 @@ used when configured; otherwise OCR runs locally with Tesseract.
 
 ### Notes
 
-- Native notebooks retain their existing stroke and blank-page rendering.
+- Notebook pages are cropped to the ink unless `full_page=True`; blank notebook
+  pages render as before.
+- The returned resource URI always serves the default (`full_page=None`) extent.
 - PDF-backed PNG pages merge the source page and annotations by default. Explicit
   `render_merged=False` preserves annotation-only access, including user-added
   PDF pages that have no underlay.
@@ -433,6 +463,96 @@ used when configured; otherwise OCR runs locally with Tesseract.
   that export. SVG and explicit `render_merged=False` require the unavailable
   rmdoc annotation layer and return clear errors.
 - RGBA colors (8-digit hex) allow transparency control
+
+---
+
+## remarkable_strokes
+
+**Get the colour, tool and page position of every stroke and text highlight on
+one page, as JSON.** Read-only; it never changes the tablet.
+
+Use it when colour or position matters: which time-grid row or to-do line has
+red ink, which text was highlighted in green, which notes were written with a
+highlighter rather than a pen.
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `document` | string | *required* | Document name or full path |
+| `page` | int | `1` | Page number (1-indexed) |
+| `include_strokes` | bool | `True` | Include the per-stroke list |
+| `cluster_gap` | float \| null | `8` | Maximum gap in PDF points between strokes of one cluster; `null` skips clustering (and OCR) |
+| `include_ocr` | bool | `False` | Recognise the handwriting in each cluster (one request per cluster, at most 40, highlighters skipped) |
+| `stroke_offset` | int | `0` | First stroke to return |
+| `max_strokes` | int | `200` | Strokes per response |
+
+### Coordinates
+
+Positions are PDF points with the origin at the top-left of the page:
+`pdf_x = rm_x * points_per_unit + width_pt / 2` and
+`pdf_y = rm_y * points_per_unit` (`points_per_unit` is 0.3177 on the
+1404x1872 grid and 0.3144 on the Paper Pro 1620x2160 grid). For an imported PDF
+the page is the PDF page itself (cropbox, rotation applied), so positions line
+up with the PDF's text. For a notebook page it is the paper at the device's
+export scale (about 446 x 595 pt on a reMarkable 2). Raw tablet coordinates are
+included as `bbox_rm` / `rects_rm`. All boxes are `[x0, y0, x1, y1]`.
+
+### Response Format
+
+Compact JSON:
+
+```json
+{
+  "document": "Day-2026-11-05",
+  "page": 1,
+  "total_pages": 2,
+  "geometry": {"kind": "pdf", "width_pt": 595.28, "height_pt": 841.89,
+               "points_per_unit": 0.3177, "pdf_page_index": 0, "rm_viewbox": [...]},
+  "summary": {
+    "stroke_count": 3, "glyph_highlight_count": 1, "eraser_count": 0,
+    "strokes_by_tool_color": [{"tool": "fineliner", "color_name": "red",
+                               "color_hex": "#B33E39", "count": 2}],
+    "glyph_highlights_by_color": [{"color_name": "green", "color_hex": "#ACFF85", "count": 1}],
+    "fallback_colors": [], "outside_page_count": 0, "cluster_count": 2
+  },
+  "strokes": [{"index": 0, "layer": "Layer 1", "tool": "fineliner",
+               "color_name": "red", "color_hex": "#B33E39", "color_raw": 7,
+               "thickness_scale": 2.0, "width_pt": 1.27, "point_count": 24,
+               "bbox_pdf": [100.0, 196.4, 140.2, 203.1],
+               "bbox_rm": [-622.1, 618.2, -495.6, 639.3]}],
+  "stroke_page": {"offset": 0, "returned": 3, "total": 3, "next_offset": null},
+  "glyph_highlights": [{"index": 0, "layer": "Layer 1", "color_name": "green",
+                        "color_hex": "#ACFF85", "color_raw": 9,
+                        "color_rgba": [172, 255, 133, 255], "text": "Standup",
+                        "rects_pdf": [[50.0, 100.0, 150.0, 112.0]], "rects_rm": [...]}],
+  "clusters": [{"cluster": 0, "tool": "fineliner", "color_name": "red",
+                "color_hex": "#B33E39", "stroke_count": 2, "stroke_indexes": [0, 1],
+                "bbox_pdf": [99.4, 195.8, 170.6, 203.7], "bbox_rm": [...]}],
+  "_hint": "Page 1/2: 3 strokes, 1 text highlights. Ink: ballpoint blue, fineliner red."
+}
+```
+
+- `color_rgba` appears only when the tablet stored an explicit colour.
+- `outside_page` marks ink drawn off the page; `layer_hidden` marks ink on a
+  hidden layer.
+- `color_name` `"unknown"` (magenta in images) means an unrecognised colour id;
+  such ids are listed in `summary.fallback_colors`.
+- Clusters group strokes of the same tool and colour that lie within
+  `cluster_gap` of each other, in reading order, at most 150 per response.
+  `stroke_indexes` always refer to the whole page.
+- A busy page can hold more than 1,000 strokes. Page through them with
+  `stroke_offset`, or set `include_strokes=False` for just the summary,
+  highlights and clusters.
+
+### Examples
+
+```python
+remarkable_strokes("Day-2026-11-05")  # ink on page 1
+remarkable_strokes("Day-2026-11-05", page=2, include_ocr=True)
+remarkable_strokes("Research Paper", page=3, include_strokes=False)
+remarkable_strokes("Notes", stroke_offset=200)  # next 200 strokes
+```
 
 ---
 

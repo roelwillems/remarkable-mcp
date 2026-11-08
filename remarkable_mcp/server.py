@@ -103,6 +103,8 @@ def _build_instructions() -> str:
 - `remarkable_recent(limit)` - Get recently modified documents
 - `remarkable_status()` - Check connection and diagnose issues
 - `remarkable_image(document, page, include_ocr)` - Get a PNG image with optional OCR
+- `remarkable_strokes(document, page)` - Colour, tool and page position (PDF points)
+  of every stroke and text highlight, as JSON
 - `remarkable_export(document, output_format)` - Export one document as a
   temporary PDF or Markdown resource
 
@@ -122,6 +124,12 @@ Use `remarkable_image` when you need visual context:
 
 Example: `remarkable_image("UI Mockup", page=1)` returns a PNG image
 Example: `remarkable_image("Notes", include_ocr=True)` returns image with extracted text
+
+Images keep each stroke's colour and tool. When colour or position matters
+(which pen, which highlighter, which line of a PDF page), use
+`remarkable_strokes("Document", page=N)`: it returns every stroke's tool,
+colour and bounding box in PDF points, text highlights with their colour, and
+nearby strokes grouped into clusters (optionally with OCR).
 
 ### Exporting a Document
 Use `remarkable_export` for a complete PDF or structured Markdown artifact.

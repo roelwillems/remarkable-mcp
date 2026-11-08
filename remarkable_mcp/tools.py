@@ -45,6 +45,7 @@ from remarkable_mcp.exporters import (
     write_native_pdf_export,
 )
 from remarkable_mcp.extract import (
+    extract_page_ink_metadata,
     extract_text_from_document_zip,
     extract_text_from_epub,
     extract_text_from_pdf,
@@ -180,6 +181,11 @@ STATUS_ANNOTATIONS = ToolAnnotations(
 
 IMAGE_ANNOTATIONS = ToolAnnotations(
     title="Get reMarkable Page Image",
+    **_BASE_ANNOTATIONS,
+)
+
+STROKES_ANNOTATIONS = ToolAnnotations(
+    title="Get reMarkable Ink Colours and Positions",
     **_BASE_ANNOTATIONS,
 )
 
@@ -364,6 +370,10 @@ async def remarkable_read(
     Use grep to search for specific content on the current page.
 
     OCR uses Google Vision when configured, otherwise Tesseract.
+
+    "annotations" returns text only. For the colour, tool and page position of
+    each stroke and highlight (which pen, which highlighter colour, which line
+    it is on), use remarkable_strokes(document, page).
     </instructions>
     <parameters>
     - document: Document name or path (use remarkable_browse to find documents)
@@ -1704,6 +1714,7 @@ async def _render_png_page(
     background: str,
     render_merged: bool,
     allow_pdf_fallback: bool,
+    full_page: Optional[bool] = False,
 ) -> tuple[Optional[bytes], Optional[str], bool, bool]:
     """Render a PNG with the same fallbacks used by remarkable_image."""
     merged_note = None
@@ -1722,6 +1733,7 @@ async def _render_png_page(
             tmp_path,
             page,
             background_color=background,
+            full_page=full_page,
         )
 
     rendered_via_pdf = False
@@ -1758,6 +1770,7 @@ async def remarkable_image(
     compatibility: bool = False,
     include_ocr: bool = False,
     render_merged: Optional[bool] = None,
+    full_page: Optional[bool] = None,
 ):
     """
     <usecase>Get an image of a specific page from a reMarkable document.</usecase>
@@ -1768,11 +1781,33 @@ async def remarkable_image(
     - Implementing designs based on hand-drawn wireframes
     - SVG format for scalable vector graphics that can be edited
 
+    ## Ink colours and tools
+
+    Every output keeps the colour and tool each stroke was written with: pen
+    colours come from the reMarkable palette, and highlighter, shader and text
+    highlights use the exact colour the tablet stored. Stroke width follows the
+    tool and its thickness. Highlights are translucent and blend with multiply,
+    so text and ink under them stay readable. In SVG every stroke carries
+    data-tool, data-color and data-color-hex (the stored colour; a highlight's
+    paint attribute is the translucent equivalent). For colour, tool and position
+    as JSON (for example "which to-do line has red ink"), use remarkable_strokes.
+
     ## Merged PDF + Annotation Rendering
 
     PNG pages backed by an imported PDF automatically composite the PDF page with
     its reMarkable annotations. Set render_merged=False for an annotation-only
     render, or True to explicitly request compositing. SVG remains annotation-only.
+
+    ## Full page or cropped
+
+    By default (full_page=None) annotation-only output of a PDF-backed page (SVG,
+    or PNG with render_merged=False) covers the whole PDF page, grown to include
+    any ink in the margins, so you can see where on the page each stroke sits.
+    The SVG's width and height are then that extent in PDF points, and data-*
+    attributes give the scale and the page rectangle (data-page-rm-viewbox).
+    Notebook pages are cropped to the ink. Set full_page=True to always render
+    the whole page, or False to always crop to the ink. The resource URI in the
+    response always serves the default (full_page=None) extent.
 
     ## Response Formats
 
@@ -1788,7 +1823,6 @@ async def remarkable_image(
     Optionally, enable include_ocr=True to extract text from the image using OCR.
     Google Vision is used when configured; otherwise OCR runs locally with Tesseract.
 
-    Note: Native notebooks retain their existing stroke rendering behavior.
     If older USB firmware returns only a native PDF export, PNG remains
     available; SVG and explicit annotation-only rendering require an rmdoc
     archive and return a clear error when it is unavailable.
@@ -1806,6 +1840,10 @@ async def remarkable_image(
     - render_merged: PDF compositing mode for PNG: None (default) automatically
       merges PDF-backed pages, True explicitly requests merging, and False returns
       the annotation-only layer. SVG output remains annotation-only.
+    - full_page: Annotation-only extent: None (default) renders PDF-backed pages
+      as the whole PDF page and crops notebook pages to the ink; True always
+      renders the whole page; False always crops to the ink. Merged PNGs are
+      always the whole PDF page.
     </parameters>
     <examples>
     - remarkable_image("UI Mockup")  # Get first page as embedded PNG resource
@@ -1817,6 +1855,8 @@ async def remarkable_image(
     - remarkable_image("Notes", include_ocr=True)  # Get image with OCR text extraction
     - remarkable_image("Annotated PDF")  # PDF + annotations composited automatically
     - remarkable_image("Annotated PDF", render_merged=False)  # Annotation layer only
+    - remarkable_image("Day page", output_format="svg")  # Whole PDF page, coloured ink
+    - remarkable_image("Notes", output_format="svg", full_page=True)  # Whole notebook page
     </examples>
     """
     try:
@@ -1924,6 +1964,7 @@ async def remarkable_image(
                     tmp_path,
                     page,
                     background_color=background,
+                    full_page=full_page,
                 )
 
                 if svg_content is None:
@@ -2008,6 +2049,7 @@ async def remarkable_image(
                         background,
                         use_merged,
                         render_merged is not False,
+                        full_page,
                     )
 
                 if png_data is None:
@@ -2131,6 +2173,186 @@ async def remarkable_image(
     except Exception as e:
         return make_error(
             error_type="image_failed",
+            message=str(e),
+            suggestion="Check remarkable_status() to verify your connection.",
+        )
+
+
+def _ocr_png_bytes(png: bytes) -> Optional[str]:
+    """OCR PNG bytes with the configured backend (Google Vision, else Tesseract)."""
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp.write(png)
+        png_path = Path(tmp.name)
+    try:
+        backend = get_ocr_backend()
+        if backend == "google" or (backend == "auto" and os.environ.get("GOOGLE_VISION_API_KEY")):
+            text = _ocr_png_google_vision(png_path)
+            if text:
+                return text
+        return _ocr_png_tesseract(png_path)
+    finally:
+        png_path.unlink(missing_ok=True)
+
+
+@mcp.tool(annotations=STROKES_ANNOTATIONS)
+async def remarkable_strokes(
+    document: str,
+    page: int = 1,
+    include_strokes: bool = True,
+    cluster_gap: Optional[float] = 8.0,
+    include_ocr: bool = False,
+    stroke_offset: int = 0,
+    max_strokes: int = 200,
+):
+    """
+    <usecase>Get the colour, tool and position of every stroke and text highlight
+    on one page, as JSON.</usecase>
+    <instructions>
+    Use this when it matters which pen, colour or highlighter was used, or where
+    on the page ink sits: for example which time-grid row or to-do line has red
+    ink, or which text was highlighted in green. It reads the page's annotation
+    layer and never changes the tablet.
+
+    Positions are PDF points with the origin at the top-left of the page. For an
+    imported PDF the page is the PDF page itself, so coordinates line up with
+    the PDF's text and layout; for a notebook page it is the paper at the
+    tablet's export scale (about 446 x 595 pt on a reMarkable 2). Raw tablet
+    coordinates (bbox_rm) are included too. geometry explains the mapping.
+
+    The response (compact JSON) has:
+    - geometry: page size in points and how tablet coordinates map onto it
+    - summary: stroke and text-highlight counts per tool and colour, plus
+      cluster_count, outside_page_count and fallback_colors
+    - strokes: up to max_strokes entries (paged, see stroke_page) with index,
+      layer, tool, color_name, color_hex, color_raw (the tablet's colour id),
+      color_rgba (only when the tablet stored an explicit colour),
+      thickness_scale, width_pt, point_count, bbox_pdf and bbox_rm; outside_page
+      is set for ink drawn off the page, layer_hidden for hidden layers
+    - stroke_page: offset, returned, total and next_offset (null when done)
+    - glyph_highlights: text highlighted on the PDF with colour, text and the
+      highlight rectangles in PDF points (rects_pdf) and tablet units (rects_rm)
+    - clusters: nearby strokes with the same tool and colour grouped together
+      (a word, a tick, a note in the margin) with stroke_indexes and bbox, in
+      reading order, at most 150; with include_ocr=True each cluster also gets
+      the recognised text
+
+    All boxes are [x0, y0, x1, y1]. Stroke indexes always refer to the whole
+    page, so clusters and strokes from different stroke pages line up.
+
+    Colour names: pens use the reMarkable palette (black, gray, white, blue,
+    red, ...); highlighters and shaders on recent firmware carry their exact
+    colour (yellow, green, blue, pink, orange, gray). color_name "unknown" means
+    the tablet used a colour this server does not know; it is shown as magenta
+    in images and listed in summary.fallback_colors.
+
+    Size: a busy page can hold over 1,000 strokes. The defaults keep a response
+    to a few tens of KB; use include_strokes=False for just the summary,
+    highlights and clusters, or page through strokes with stroke_offset.
+    </instructions>
+    <parameters>
+    - document: Document name or path (use remarkable_browse to find documents)
+    - page: Page number (default: 1, 1-indexed)
+    - include_strokes: Include the per-stroke list (default: True)
+    - cluster_gap: Maximum gap in PDF points between strokes of one cluster
+      (default: 8). Use null to skip clustering (and OCR).
+    - include_ocr: Recognise the handwriting in each cluster (default: False;
+      Google Vision when configured, otherwise Tesseract; one request per
+      cluster, at most 40 clusters, highlighters skipped)
+    - stroke_offset: First stroke to return (default: 0)
+    - max_strokes: Strokes per response (default: 200)
+    </parameters>
+    <examples>
+    - remarkable_strokes("Day-2026-11-05")  # Ink on the first page
+    - remarkable_strokes("Day-2026-11-05", page=2, include_ocr=True)
+    - remarkable_strokes("Research Paper", page=3, include_strokes=False)
+    - remarkable_strokes("Notes", stroke_offset=200)  # Next 200 strokes
+    </examples>
+    """
+    try:
+        client = await run_blocking(get_rmapi)
+        collection = await run_blocking(client.get_meta_items)
+        items_by_id = get_items_by_id(collection)
+        target_doc = _find_target_document(collection, items_by_id, document)
+        if not target_doc:
+            root = _get_root_path()
+            documents = [
+                item
+                for item in collection
+                if not item.is_folder
+                and not _is_cloud_archived(item)
+                and _is_within_root(get_item_path(item, items_by_id), root)
+            ]
+            similar = find_similar_documents(document, documents)
+            return make_error(
+                error_type="document_not_found",
+                message=f"Document not found: '{document}'",
+                suggestion="Try remarkable_browse(query='...') to search for the document.",
+                did_you_mean=similar if similar else None,
+            )
+
+        raw_doc = await run_blocking(client.download, target_doc)
+        if _is_pdf_payload(raw_doc):
+            return make_error(
+                error_type="strokes_not_available",
+                message=(
+                    "Stroke metadata is unavailable because this transport returned a "
+                    "native PDF instead of a document archive."
+                ),
+                suggestion="Connect through cloud, SSH or newer USB firmware that supports rmdoc.",
+            )
+
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            tmp.write(raw_doc)
+            tmp_path = Path(tmp.name)
+        try:
+            data = await run_blocking(
+                extract_page_ink_metadata,
+                tmp_path,
+                page,
+                include_strokes=include_strokes,
+                cluster_gap_pt=cluster_gap,
+                ocr=_ocr_png_bytes if include_ocr else None,
+                stroke_offset=stroke_offset,
+                max_strokes=max_strokes,
+            )
+        except ValueError as exc:
+            return make_error(
+                error_type="page_out_of_range",
+                message=str(exc),
+                suggestion="Use a page number within the document.",
+            )
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+        doc_path = _apply_root_filter(get_item_path(target_doc, items_by_id))
+        response = {"document": target_doc.VissibleName, "path": doc_path, **data}
+        summary = data.get("summary", {})
+        parts = [
+            f"Page {page}/{data.get('total_pages')}: {summary.get('stroke_count', 0)} strokes",
+            f"{summary.get('glyph_highlight_count', 0)} text highlights",
+        ]
+        colours = sorted(
+            {
+                f"{entry['tool']} {entry['color_name']}"
+                for entry in summary.get("strokes_by_tool_color", [])
+            }
+        )
+        hint = ", ".join(parts) + "."
+        if colours:
+            hint += f" Ink: {', '.join(colours)}."
+        if data.get("note"):
+            hint = f"{data['note']} {hint}"
+        if summary.get("fallback_colors"):
+            hint += f" Unknown colour ids {summary['fallback_colors']} are shown as magenta."
+        next_offset = (data.get("stroke_page") or {}).get("next_offset")
+        if next_offset is not None:
+            hint += f" More strokes: call again with stroke_offset={next_offset}."
+        if summary.get("clusters_truncated"):
+            hint += f" Showing the first 150 of {summary.get('cluster_count')} clusters."
+        return make_response(response, hint, compact=True)
+    except Exception as e:
+        return make_error(
+            error_type="strokes_failed",
             message=str(e),
             suggestion="Check remarkable_status() to verify your connection.",
         )
@@ -2392,7 +2614,9 @@ async def remarkable_export(
     - `pdf_mode="merged"` (default) preserves complete physical pages, combining
       mapped PDF underlays and reMarkable annotations.
     - `pdf_mode="annotations"` exports full-page annotation layers only when the
-      transport provides a document archive.
+      transport provides a document archive. Pages of an imported PDF keep the
+      PDF page's size and position; other pages use the tablet's paper size.
+    - Both modes keep each stroke's colour and tool; highlights are translucent.
     - Pages remain in physical device order. A render failure produces a labeled
       placeholder at that ordinal and a partial-export warning; pages are not skipped.
 
